@@ -124,19 +124,33 @@ outputs = llm.generate(["Hello"], params)
 
 #### Per-request steering (OpenAI-compatible server)
 
+HTTP fields use a base64-packed binary wire format — see
+[`examples/online_serving/openai_steering_client.py`](examples/online_serving/openai_steering_client.py)
+for a runnable client. Sketch:
+
 ```python
+import base64
+import numpy as np
 from openai import OpenAI
 
 client = OpenAI(base_url="http://localhost:8000/v1", api_key="unused")
 
+vec = np.random.standard_normal(2560).astype(np.float16)
+stacked = np.stack([vec], axis=0)  # (num_layers, hidden_size)
+packed = {
+    "post_mlp": {
+        "dtype": str(stacked.dtype),
+        "shape": list(stacked.shape),
+        "layer_indices": [15],
+        "data": base64.b64encode(stacked.tobytes()).decode("ascii"),
+        "scales": [2.0],  # optional per-row scales
+    }
+}
+
 response = client.chat.completions.create(
     model="google/gemma-3-4b-it",
     messages=[{"role": "user", "content": "Hello"}],
-    extra_body={
-        "steering_vectors":         {"post_mlp": {15: [0.1, 0.2]}},
-        "prefill_steering_vectors": {"pre_attn": {15: [0.3, 0.4]}},
-        "decode_steering_vectors":  {"pre_attn": {15: [0.5, 0.6]}},
-    },
+    extra_body={"steering_vectors": packed},
 )
 ```
 

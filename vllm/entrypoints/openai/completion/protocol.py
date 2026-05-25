@@ -11,7 +11,6 @@ from pydantic import Field, model_validator
 
 from vllm.config import ModelConfig
 from vllm.config.steering_types import (
-    SteeringVectorSpec,
     SteeringVectorSpecPacked,
     unpack_steering_vectors,
 )
@@ -185,47 +184,29 @@ class CompletionRequest(OpenAIBaseModel):
         "can detect such behavior and terminate early, saving time and tokens.",
     )
 
-    steering_vectors: SteeringVectorSpec | None = Field(
+    # Per-request inline steering vectors in binary wire format.  Each entry
+    # is ``{dtype, shape, layer_indices, data: base64, scales?}`` — see
+    # ``vllm.config.steering_types.SteeringHookPacked``.  The packed form
+    # avoids the JSON parse + ``np.asarray(list_of_floats)`` overhead that
+    # dominates inline-request preprocessing on the API-server thread.
+    steering_vectors: SteeringVectorSpecPacked | None = Field(
         default=None,
         description="Per-request activation steering vectors keyed by hook "
-        "point name (pre_attn, post_attn, post_mlp), then layer index. "
-        "Values are either bare "
-        'list[float] (scale=1.0) or {"vector": [...], "scale": float}.',
+        "point name (pre_attn, post_attn, post_mlp). Each hook carries one "
+        "base64-encoded (num_layers, hidden_size) blob plus a sibling "
+        "layer_indices list (and optional per-row scales).",
     )
 
-    prefill_steering_vectors: SteeringVectorSpec | None = Field(
+    prefill_steering_vectors: SteeringVectorSpecPacked | None = Field(
         default=None,
         description="Phase-specific steering vectors added to base during "
-        "prefill only. Same format as steering_vectors.",
+        "prefill only. Same packed format as steering_vectors.",
     )
 
-    decode_steering_vectors: SteeringVectorSpec | None = Field(
+    decode_steering_vectors: SteeringVectorSpecPacked | None = Field(
         default=None,
         description="Phase-specific steering vectors added to base during "
-        "decode only. Same format as steering_vectors.",
-    )
-
-    # Binary wire format alternative to steering_vectors / prefill_* / decode_*.
-    # When set, takes precedence over the matching list-of-floats field.  Each
-    # entry is {dtype, shape, layer_indices, data: base64} — see
-    # ``vllm.config.steering_types.SteeringHookPacked``.  Skips the JSON parse
-    # + ``np.asarray(list_of_floats)`` overhead that dominates inline-mode
-    # request preprocessing on the API-server thread.
-    steering_vectors_packed: SteeringVectorSpecPacked | None = Field(
-        default=None,
-        description="Binary-wire form of steering_vectors. One blob per hook "
-        "carrying base64 bytes of a (num_layers, hidden_size) array. "
-        "Takes precedence over steering_vectors when set.",
-    )
-    prefill_steering_vectors_packed: SteeringVectorSpecPacked | None = Field(
-        default=None,
-        description="Binary-wire form of prefill_steering_vectors. "
-        "Takes precedence over prefill_steering_vectors when set.",
-    )
-    decode_steering_vectors_packed: SteeringVectorSpecPacked | None = Field(
-        default=None,
-        description="Binary-wire form of decode_steering_vectors. "
-        "Takes precedence over decode_steering_vectors when set.",
+        "decode only. Same packed format as steering_vectors.",
     )
 
     steering_name: str | None = Field(
@@ -389,20 +370,12 @@ class CompletionRequest(OpenAIBaseModel):
             extra_args=extra_args or None,
             skip_clone=True,  # Created fresh per request, safe to skip clone
             repetition_detection=self.repetition_detection,
-            steering_vectors=(
-                unpack_steering_vectors(self.steering_vectors_packed)
-                if self.steering_vectors_packed is not None
-                else self.steering_vectors
+            steering_vectors=unpack_steering_vectors(self.steering_vectors),
+            prefill_steering_vectors=unpack_steering_vectors(
+                self.prefill_steering_vectors
             ),
-            prefill_steering_vectors=(
-                unpack_steering_vectors(self.prefill_steering_vectors_packed)
-                if self.prefill_steering_vectors_packed is not None
-                else self.prefill_steering_vectors
-            ),
-            decode_steering_vectors=(
-                unpack_steering_vectors(self.decode_steering_vectors_packed)
-                if self.decode_steering_vectors_packed is not None
-                else self.decode_steering_vectors
+            decode_steering_vectors=unpack_steering_vectors(
+                self.decode_steering_vectors
             ),
         )
         if self.capture is not None:

@@ -2,12 +2,28 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Tests for steering vector plumbing through OpenAI-compatible protocol models.
 
-Verifies that ChatCompletionRequest and CompletionRequest accept all three
-steering fields (steering_vectors, prefill_steering_vectors,
-decode_steering_vectors) with both bare list[float] and scaled
-{"vector": [...], "scale": float} formats, and that to_sampling_params()
-passes them through correctly.
+The HTTP fields ``steering_vectors`` / ``prefill_steering_vectors`` /
+``decode_steering_vectors`` accept only the binary wire format
+(``SteeringHookPacked``).  The legacy ``list[float]`` form is rejected at
+pydantic validation — clients must pack vectors before sending.
+
+Covers:
+
+- both ``ChatCompletionRequest`` and ``CompletionRequest`` accept all three
+  tiers in packed form
+- legacy ``list[float]`` and ``{"vector": [...], "scale": float}`` request
+  bodies fail validation
+- ``to_sampling_params`` unpacks the wire format to per-layer ``ndarray``
+  dicts on ``SamplingParams``
+- optional per-row ``scales`` are applied at unpack time
+- ``steering_name`` field is unaffected
 """
+
+import base64
+
+import numpy as np
+import pytest
+from pydantic import ValidationError
 
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionRequest,
@@ -18,23 +34,35 @@ from vllm.entrypoints.openai.completion.protocol import CompletionRequest
 # Fixtures / helpers
 # ---------------------------------------------------------------------------
 
-_BARE_VECTORS = {
-    "pre_attn": {15: [0.1, 0.2, 0.3]},
-}
+_HIDDEN = 8
 
-_SCALED_VECTORS = {
-    "post_mlp": {
-        10: {"vector": [0.4, 0.5, 0.6], "scale": 2.0},
-    },
-}
 
-_PREFILL_VECTORS = {
-    "pre_attn": {15: [0.7, 0.8, 0.9]},
-}
+def _pack(
+    layer_vectors: dict[int, list[float]],
+    *,
+    dtype: np.dtype = np.dtype(np.float32),
+    scales: list[float] | None = None,
+) -> dict:
+    """Build one ``SteeringHookPacked`` blob from per-layer Python lists."""
+    layer_indices = sorted(layer_vectors.keys())
+    stacked = np.stack(
+        [np.asarray(layer_vectors[i], dtype=dtype) for i in layer_indices],
+        axis=0,
+    )
+    blob: dict = {
+        "dtype": str(stacked.dtype),
+        "shape": list(stacked.shape),
+        "layer_indices": layer_indices,
+        "data": base64.b64encode(stacked.tobytes()).decode("ascii"),
+    }
+    if scales is not None:
+        blob["scales"] = scales
+    return blob
 
-_DECODE_VECTORS = {
-    "post_attn": {20: [1.0, 1.1, 1.2]},
-}
+
+_BASE_PACKED = {"pre_attn": _pack({15: [0.1] * _HIDDEN})}
+_PREFILL_PACKED = {"pre_attn": _pack({15: [0.7] * _HIDDEN})}
+_DECODE_PACKED = {"post_attn": _pack({20: [1.0] * _HIDDEN})}
 
 _CHAT_BASE = {
     "messages": [{"role": "user", "content": "Hello"}],
@@ -69,66 +97,74 @@ class TestChatCompletionSteering:
         assert req.prefill_steering_vectors is None
         assert req.decode_steering_vectors is None
 
-    def test_bare_steering_vectors(self):
-        req = _make_chat(steering_vectors=_BARE_VECTORS)
-        assert req.steering_vectors == _BARE_VECTORS
+    def test_packed_steering_vectors(self):
+        req = _make_chat(steering_vectors=_BASE_PACKED)
+        assert req.steering_vectors == _BASE_PACKED
 
-    def test_scaled_steering_vectors(self):
-        req = _make_chat(steering_vectors=_SCALED_VECTORS)
-        assert req.steering_vectors == _SCALED_VECTORS
+    def test_packed_prefill_steering_vectors(self):
+        req = _make_chat(prefill_steering_vectors=_PREFILL_PACKED)
+        assert req.prefill_steering_vectors == _PREFILL_PACKED
 
-    def test_prefill_steering_vectors(self):
-        req = _make_chat(prefill_steering_vectors=_PREFILL_VECTORS)
-        assert req.prefill_steering_vectors == _PREFILL_VECTORS
-
-    def test_decode_steering_vectors(self):
-        req = _make_chat(decode_steering_vectors=_DECODE_VECTORS)
-        assert req.decode_steering_vectors == _DECODE_VECTORS
+    def test_packed_decode_steering_vectors(self):
+        req = _make_chat(decode_steering_vectors=_DECODE_PACKED)
+        assert req.decode_steering_vectors == _DECODE_PACKED
 
     def test_all_three_tiers(self):
         req = _make_chat(
-            steering_vectors=_BARE_VECTORS,
-            prefill_steering_vectors=_PREFILL_VECTORS,
-            decode_steering_vectors=_DECODE_VECTORS,
+            steering_vectors=_BASE_PACKED,
+            prefill_steering_vectors=_PREFILL_PACKED,
+            decode_steering_vectors=_DECODE_PACKED,
         )
-        assert req.steering_vectors == _BARE_VECTORS
-        assert req.prefill_steering_vectors == _PREFILL_VECTORS
-        assert req.decode_steering_vectors == _DECODE_VECTORS
+        assert req.steering_vectors == _BASE_PACKED
+        assert req.prefill_steering_vectors == _PREFILL_PACKED
+        assert req.decode_steering_vectors == _DECODE_PACKED
 
-    def test_to_sampling_params_passes_all_fields(self):
+    def test_legacy_list_of_floats_rejected(self):
+        with pytest.raises(ValidationError):
+            _make_chat(steering_vectors={"pre_attn": {15: [0.1, 0.2, 0.3]}})
+
+    def test_legacy_scaled_dict_rejected(self):
+        with pytest.raises(ValidationError):
+            _make_chat(
+                steering_vectors={
+                    "post_mlp": {10: {"vector": [0.4, 0.5, 0.6], "scale": 2.0}}
+                }
+            )
+
+    def test_to_sampling_params_unpacks_all_fields(self):
         req = _make_chat(
-            steering_vectors=_BARE_VECTORS,
-            prefill_steering_vectors=_PREFILL_VECTORS,
-            decode_steering_vectors=_DECODE_VECTORS,
+            steering_vectors=_BASE_PACKED,
+            prefill_steering_vectors=_PREFILL_PACKED,
+            decode_steering_vectors=_DECODE_PACKED,
         )
-        sp = req.to_sampling_params(
-            max_tokens=100,
-            default_sampling_params={},
+        sp = req.to_sampling_params(max_tokens=100, default_sampling_params={})
+        assert sp.steering_vectors is not None
+        assert sp.steering_vectors["pre_attn"][15].tolist() == pytest.approx(
+            [0.1] * _HIDDEN
         )
-        assert sp.steering_vectors == _BARE_VECTORS
-        assert sp.prefill_steering_vectors == _PREFILL_VECTORS
-        assert sp.decode_steering_vectors == _DECODE_VECTORS
+        assert sp.prefill_steering_vectors["pre_attn"][15].tolist() == pytest.approx(
+            [0.7] * _HIDDEN
+        )
+        assert sp.decode_steering_vectors["post_attn"][20].tolist() == pytest.approx(
+            [1.0] * _HIDDEN
+        )
 
     def test_to_sampling_params_none_when_absent(self):
         req = _make_chat()
-        sp = req.to_sampling_params(
-            max_tokens=100,
-            default_sampling_params={},
-        )
+        sp = req.to_sampling_params(max_tokens=100, default_sampling_params={})
         assert sp.steering_vectors is None
         assert sp.prefill_steering_vectors is None
         assert sp.decode_steering_vectors is None
 
-    def test_scaled_format_passes_through(self):
-        req = _make_chat(steering_vectors=_SCALED_VECTORS)
-        sp = req.to_sampling_params(
-            max_tokens=100,
-            default_sampling_params={},
+    def test_per_row_scales_applied_at_unpack(self):
+        packed = {
+            "post_mlp": _pack({10: [1.0] * _HIDDEN}, scales=[2.0]),
+        }
+        req = _make_chat(steering_vectors=packed)
+        sp = req.to_sampling_params(max_tokens=100, default_sampling_params={})
+        assert sp.steering_vectors["post_mlp"][10].tolist() == pytest.approx(
+            [2.0] * _HIDDEN
         )
-        entry = sp.steering_vectors["post_mlp"][10]
-        assert isinstance(entry, dict)
-        assert entry["vector"] == [0.4, 0.5, 0.6]
-        assert entry["scale"] == 2.0
 
 
 # ---------------------------------------------------------------------------
@@ -145,42 +181,56 @@ class TestCompletionSteering:
         assert req.prefill_steering_vectors is None
         assert req.decode_steering_vectors is None
 
-    def test_bare_steering_vectors(self):
-        req = _make_completion(steering_vectors=_BARE_VECTORS)
-        assert req.steering_vectors == _BARE_VECTORS
+    def test_packed_steering_vectors(self):
+        req = _make_completion(steering_vectors=_BASE_PACKED)
+        assert req.steering_vectors == _BASE_PACKED
 
-    def test_scaled_steering_vectors(self):
-        req = _make_completion(steering_vectors=_SCALED_VECTORS)
-        assert req.steering_vectors == _SCALED_VECTORS
+    def test_packed_prefill_steering_vectors(self):
+        req = _make_completion(prefill_steering_vectors=_PREFILL_PACKED)
+        assert req.prefill_steering_vectors == _PREFILL_PACKED
 
-    def test_prefill_steering_vectors(self):
-        req = _make_completion(prefill_steering_vectors=_PREFILL_VECTORS)
-        assert req.prefill_steering_vectors == _PREFILL_VECTORS
-
-    def test_decode_steering_vectors(self):
-        req = _make_completion(decode_steering_vectors=_DECODE_VECTORS)
-        assert req.decode_steering_vectors == _DECODE_VECTORS
+    def test_packed_decode_steering_vectors(self):
+        req = _make_completion(decode_steering_vectors=_DECODE_PACKED)
+        assert req.decode_steering_vectors == _DECODE_PACKED
 
     def test_all_three_tiers(self):
         req = _make_completion(
-            steering_vectors=_BARE_VECTORS,
-            prefill_steering_vectors=_PREFILL_VECTORS,
-            decode_steering_vectors=_DECODE_VECTORS,
+            steering_vectors=_BASE_PACKED,
+            prefill_steering_vectors=_PREFILL_PACKED,
+            decode_steering_vectors=_DECODE_PACKED,
         )
-        assert req.steering_vectors == _BARE_VECTORS
-        assert req.prefill_steering_vectors == _PREFILL_VECTORS
-        assert req.decode_steering_vectors == _DECODE_VECTORS
+        assert req.steering_vectors == _BASE_PACKED
+        assert req.prefill_steering_vectors == _PREFILL_PACKED
+        assert req.decode_steering_vectors == _DECODE_PACKED
 
-    def test_to_sampling_params_passes_all_fields(self):
+    def test_legacy_list_of_floats_rejected(self):
+        with pytest.raises(ValidationError):
+            _make_completion(steering_vectors={"pre_attn": {15: [0.1, 0.2, 0.3]}})
+
+    def test_legacy_scaled_dict_rejected(self):
+        with pytest.raises(ValidationError):
+            _make_completion(
+                steering_vectors={
+                    "post_mlp": {10: {"vector": [0.4, 0.5, 0.6], "scale": 2.0}}
+                }
+            )
+
+    def test_to_sampling_params_unpacks_all_fields(self):
         req = _make_completion(
-            steering_vectors=_BARE_VECTORS,
-            prefill_steering_vectors=_PREFILL_VECTORS,
-            decode_steering_vectors=_DECODE_VECTORS,
+            steering_vectors=_BASE_PACKED,
+            prefill_steering_vectors=_PREFILL_PACKED,
+            decode_steering_vectors=_DECODE_PACKED,
         )
         sp = req.to_sampling_params(max_tokens=100)
-        assert sp.steering_vectors == _BARE_VECTORS
-        assert sp.prefill_steering_vectors == _PREFILL_VECTORS
-        assert sp.decode_steering_vectors == _DECODE_VECTORS
+        assert sp.steering_vectors["pre_attn"][15].tolist() == pytest.approx(
+            [0.1] * _HIDDEN
+        )
+        assert sp.prefill_steering_vectors["pre_attn"][15].tolist() == pytest.approx(
+            [0.7] * _HIDDEN
+        )
+        assert sp.decode_steering_vectors["post_attn"][20].tolist() == pytest.approx(
+            [1.0] * _HIDDEN
+        )
 
     def test_to_sampling_params_none_when_absent(self):
         req = _make_completion()
@@ -189,13 +239,15 @@ class TestCompletionSteering:
         assert sp.prefill_steering_vectors is None
         assert sp.decode_steering_vectors is None
 
-    def test_scaled_format_passes_through(self):
-        req = _make_completion(steering_vectors=_SCALED_VECTORS)
+    def test_per_row_scales_applied_at_unpack(self):
+        packed = {
+            "post_mlp": _pack({10: [1.0] * _HIDDEN}, scales=[2.0]),
+        }
+        req = _make_completion(steering_vectors=packed)
         sp = req.to_sampling_params(max_tokens=100)
-        entry = sp.steering_vectors["post_mlp"][10]
-        assert isinstance(entry, dict)
-        assert entry["vector"] == [0.4, 0.5, 0.6]
-        assert entry["scale"] == 2.0
+        assert sp.steering_vectors["post_mlp"][10].tolist() == pytest.approx(
+            [2.0] * _HIDDEN
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -226,7 +278,7 @@ class TestSteeringNameField:
         """Both steering_name and inline vectors can be set simultaneously."""
         chat = _make_chat(
             steering_name="base_personality",
-            steering_vectors=_BARE_VECTORS,
+            steering_vectors=_BASE_PACKED,
         )
         assert chat.steering_name == "base_personality"
         assert chat.steering_vectors is not None

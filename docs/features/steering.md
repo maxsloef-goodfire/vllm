@@ -234,30 +234,52 @@ params = SamplingParams(
 outputs = llm.generate(["Hello"], params)
 ```
 
+### OpenAI-Compatible Server
+
 Per-request steering is also available through the OpenAI-compatible server
-using `extra_body`:
+using `extra_body`. The HTTP fields use a binary wire format: each hook
+carries one base64-encoded `(num_layers, hidden_size)` blob plus a sibling
+`layer_indices` list. The server decodes via `np.frombuffer` (zero-copy
+view) — microseconds vs. the ~10–15 ms per request a JSON `list[float]`
+payload would cost on the API-server event loop.
 
 ```python
+import base64
+
+import numpy as np
 from openai import OpenAI
 
 client = OpenAI(base_url="http://localhost:8000/v1", api_key="unused")
 
+vec = np.random.standard_normal(2560).astype(np.float16)
+stacked = np.stack([vec], axis=0)  # (num_layers, hidden_size)
+
+base = {
+    "post_mlp": {
+        "dtype": str(stacked.dtype),  # "float16" | "float32" | "float64"
+        "shape": list(stacked.shape),
+        "layer_indices": [15],
+        "data": base64.b64encode(stacked.tobytes()).decode("ascii"),
+        # Optional: per-row scales, matched 1:1 with layer_indices.
+        # Mirrors the {"vector": [...], "scale": float} form available
+        # to the in-process SamplingParams API without baking the
+        # multiplier into the bytes.
+        "scales": [2.0],
+    }
+}
+
 response = client.chat.completions.create(
     model="google/gemma-3-4b-it",
     messages=[{"role": "user", "content": "Hello"}],
-    extra_body={
-        "steering_vectors": {
-            "post_mlp": {15: [0.1, 0.2]},
-        },
-        "prefill_steering_vectors": {
-            "pre_attn": {15: [0.3, 0.4]},
-        },
-        "decode_steering_vectors": {
-            "pre_attn": {15: [0.5, 0.6]},
-        },
-    },
+    extra_body={"steering_vectors": base},
 )
 ```
+
+`prefill_steering_vectors` and `decode_steering_vectors` accept the same
+packed shape for phase-specific additions.
+
+See [`examples/online_serving/openai_steering_client.py`](../../examples/online_serving/openai_steering_client.py)
+for a runnable end-to-end client.
 
 ## Named Steering Modules
 
