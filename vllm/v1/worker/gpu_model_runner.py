@@ -4687,6 +4687,14 @@ class GPUModelRunner(
                     assert isinstance(hidden_states, IntermediateTensors)
                     hidden_states.kv_connector_output = kv_connector_output
                     self.kv_connector_output = kv_connector_output
+                    # Non-last PP stages return here, before ``sample_tokens``
+                    # (and its ``_finalize_capture_step``) ever runs for this
+                    # step. The forward above has already populated this
+                    # stage's capture scratch, so dispatch it now — otherwise
+                    # only the last stage's layers reach consumers and the
+                    # earlier stages' files are written empty.
+                    if self._capture_manager is not None:
+                        self._finalize_capture_step()
                     return hidden_states
 
                 if self.is_pooling_model:
