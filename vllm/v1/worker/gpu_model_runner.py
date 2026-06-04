@@ -607,6 +607,25 @@ class GPUModelRunner(
                 # the compiled forward graph.
                 set_active_capture_manager(self._capture_manager)
 
+            # TODO(capture-pp): temporary instrumentation — which ranks
+            # install a manager and over which layer slice.
+            try:
+                _pp = get_pp_group().rank_in_group
+                _tp = get_tp_group().rank_in_group
+                _rng = self.model_config.get_layers_start_end_indices(
+                    self.vllm_config.parallel_config
+                )
+            except Exception:
+                _pp, _tp, _rng = -1, -1, None
+            logger.info(
+                "[capture-debug] init pp_rank=%s tp_rank=%s "
+                "manager_installed=%s local_layer_range=%s",
+                _pp,
+                _tp,
+                self._capture_manager is not None,
+                _rng,
+            )
+
         self.eplb_state: EplbState | None = None
         self._moe_model: MixtureOfExperts | None = None
         # NOTE(yongji): flag to temporarily disable EPLB during scaling up/down
@@ -1632,6 +1651,16 @@ class GPUModelRunner(
         mgr = self._capture_manager
 
         sp = new_req_data.sampling_params
+        # TODO(capture-pp): temporary instrumentation — confirms each stage
+        # reaches admission with a capture-bearing sampling_params.
+        _cap = getattr(sp, "capture", None) if sp is not None else None
+        logger.info(
+            "[capture-debug] admit pp_rank=%s req=%s sp=%s capture_keys=%s",
+            get_pp_group().rank_in_group,
+            new_req_data.req_id,
+            sp is not None,
+            list(_cap) if isinstance(_cap, dict) else _cap,
+        )
         if sp is None:
             return
 
@@ -4439,44 +4468,18 @@ class GPUModelRunner(
                 self._prepare_capture_step(scheduler_output)
                 capture_pending = self._capture_manager.has_pending_capture()
 
-            # Cross-rank force-eager agreement. Capturing a step forces
-            # eager execution (the per-step gather can't run inside a
-            # replayed CUDA graph), and every rank in the forward must
-            # agree on ``num_tokens_padded`` for the TP all-reduce / PP
-            # send-recv to line up. The capturer gate + per-stage layer
-            # filtering mean only some ranks see a given capture (e.g. a
-            # request that captures a layer living on a single PP stage),
-            # so OR-reduce the flag across both forward-collective groups:
-            # if ANY rank captures this step, ALL run eager. We reduce over
-            # the TP and PP groups (not the world group, which carries no
-            # device communicator) — sum-then-``>0`` over both yields the
-            # global OR. Gated on the feature flag (identical on every
-            # rank) so every rank reaches the collective.
+            # Force eager on every step while the capture feature is
+            # enabled. The per-step gather can't run inside a replayed CUDA
+            # graph, and under pipeline parallelism every rank must agree on
+            # ``num_tokens_padded`` for the TP all-reduce / PP send-recv to
+            # line up. Deciding purely from the feature flag (identical on
+            # every rank) keeps all ranks in lockstep with no per-step
+            # collective — a cross-PP all-reduce here would be a synchronous
+            # barrier inside PP's asynchronous pipeline and deadlock against
+            # the send/recv. Costs cudagraph speed while capture is
+            # configured, which is acceptable for a capture run.
             if self._capture_feature_enabled:
-                tp_group = get_tp_group()
-                pp_group = get_pp_group()
-                if tp_group.world_size > 1 or pp_group.world_size > 1:
-                    local_capture = capture_pending
-                    flag = torch.tensor(
-                        [1 if local_capture else 0],
-                        device=self.device,
-                        dtype=torch.int32,
-                    )
-                    if tp_group.world_size > 1:
-                        flag = tp_group.all_reduce(flag)
-                    if pp_group.world_size > 1:
-                        flag = pp_group.all_reduce(flag)
-                    capture_pending = bool(flag.item() > 0)
-                    if capture_pending:
-                        # TODO(capture-pp): temporary instrumentation.
-                        logger.info(
-                            "[capture-debug] step force-eager: pp_rank=%d "
-                            "tp_rank=%d local_capture=%s world_capture=%s",
-                            pp_group.rank_in_group,
-                            tp_group.rank_in_group,
-                            local_capture,
-                            capture_pending,
-                        )
+                capture_pending = True
 
             (
                 cudagraph_mode,
