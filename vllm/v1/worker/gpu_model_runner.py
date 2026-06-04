@@ -607,25 +607,6 @@ class GPUModelRunner(
                 # the compiled forward graph.
                 set_active_capture_manager(self._capture_manager)
 
-            # TODO(capture-pp): temporary instrumentation — which ranks
-            # install a manager and over which layer slice.
-            try:
-                _pp = get_pp_group().rank_in_group
-                _tp = get_tp_group().rank_in_group
-                _rng = self.model_config.get_layers_start_end_indices(
-                    self.vllm_config.parallel_config
-                )
-            except Exception:
-                _pp, _tp, _rng = -1, -1, None
-            logger.info(
-                "[capture-debug] init pp_rank=%s tp_rank=%s "
-                "manager_installed=%s local_layer_range=%s",
-                _pp,
-                _tp,
-                self._capture_manager is not None,
-                _rng,
-            )
-
         self.eplb_state: EplbState | None = None
         self._moe_model: MixtureOfExperts | None = None
         # NOTE(yongji): flag to temporarily disable EPLB during scaling up/down
@@ -1651,16 +1632,6 @@ class GPUModelRunner(
         mgr = self._capture_manager
 
         sp = new_req_data.sampling_params
-        # TODO(capture-pp): temporary instrumentation — confirms each stage
-        # reaches admission with a capture-bearing sampling_params.
-        _cap = getattr(sp, "capture", None) if sp is not None else None
-        logger.info(
-            "[capture-debug] admit pp_rank=%s req=%s sp=%s capture_keys=%s",
-            get_pp_group().rank_in_group,
-            new_req_data.req_id,
-            sp is not None,
-            list(_cap) if isinstance(_cap, dict) else _cap,
-        )
         if sp is None:
             return
 
