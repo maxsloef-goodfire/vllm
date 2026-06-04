@@ -422,7 +422,37 @@ class CaptureManager:
         # merges per-stage results. Consumers left with no in-range layer
         # are inactive for this request on this rank.
         start, end = self._local_layer_range
+        requested_layers = sorted(
+            {
+                layer
+                for spec in merged.values()
+                for layers in spec.hooks.values()
+                for layer in layers
+            }
+        )
         merged = _filter_specs_to_layer_range(merged, start, end)
+        kept_layers = sorted(
+            {
+                layer
+                for spec in merged.values()
+                for layers in spec.hooks.values()
+                for layer in layers
+            }
+        )
+        # TODO(capture-pp): temporary instrumentation — confirms each
+        # pipeline stage's owned range vs the requested layers. Remove
+        # once PP capture is verified on real hardware.
+        logger.info(
+            "[capture-debug] register req=%s local_layer_range=[%d,%d) "
+            "global_layers=%d requested=%s kept=%s -> %s",
+            req_id,
+            start,
+            end,
+            self._num_hidden_layers,
+            requested_layers,
+            kept_layers,
+            "REGISTERED" if merged else "SKIPPED(no local layers)",
+        )
         if not merged:
             # None of the requested layers live on this stage.
             return

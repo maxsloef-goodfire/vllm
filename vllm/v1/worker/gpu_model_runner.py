@@ -45,6 +45,7 @@ from vllm.distributed.parallel_state import (
     get_dcp_group,
     get_pp_group,
     get_tp_group,
+    get_world_group,
     graph_capture,
     is_global_first_rank,
     prepare_communication_buffer_for_model,
@@ -519,6 +520,13 @@ class GPUModelRunner(
         # Pending terminal results keyed by request id → consumer name →
         # ``CaptureResult``.  Drained onto every ``ModelRunnerOutput``.
         self._pending_capture_results: dict[str, dict[str, CaptureResult]] = {}
+        # Set on *every* rank (capturer or not) — drives the per-step
+        # cross-rank force-eager agreement in ``execute_model`` so all
+        # ranks participate in the collective. Independent of the
+        # capturer gate, which only controls who installs a manager.
+        self._capture_feature_enabled = (
+            self.vllm_config.capture_consumers_config is not None
+        )
         if self.vllm_config.capture_consumers_config is not None:
             from vllm.model_executor.layers.activation_capture import (
                 set_active_capture_manager,
@@ -4431,6 +4439,40 @@ class GPUModelRunner(
             if self._capture_manager is not None:
                 self._prepare_capture_step(scheduler_output)
                 capture_pending = self._capture_manager.has_pending_capture()
+
+            # Cross-rank force-eager agreement. Capturing a step forces
+            # eager execution (the per-step gather can't run inside a
+            # replayed CUDA graph), and every rank in the forward must
+            # agree on ``num_tokens_padded`` for the TP all-reduce / PP
+            # send-recv to line up. The capturer gate + per-stage layer
+            # filtering mean only some ranks see a given capture (e.g. a
+            # request that captures a layer living on a single PP stage),
+            # so reduce the flag across the whole world: if ANY rank
+            # captures this step, ALL run eager. Gated on the feature flag
+            # (identical on every rank) so every rank reaches the
+            # collective; ``self.device`` keeps it off the host critical
+            # path apart from the single ``.item()`` sync.
+            if self._capture_feature_enabled:
+                world = get_world_group()
+                if world.world_size > 1:
+                    local_capture = capture_pending
+                    flag = torch.tensor(
+                        [1 if local_capture else 0],
+                        device=self.device,
+                        dtype=torch.int32,
+                    )
+                    flag = world.all_reduce(flag)
+                    capture_pending = bool(flag.item() > 0)
+                    if capture_pending:
+                        # TODO(capture-pp): temporary instrumentation.
+                        logger.info(
+                            "[capture-debug] step force-eager: pp_rank=%d "
+                            "tp_rank=%d local_capture=%s world_capture=%s",
+                            get_pp_group().rank_in_group,
+                            get_tp_group().rank_in_group,
+                            local_capture,
+                            capture_pending,
+                        )
 
             (
                 cudagraph_mode,
