@@ -45,7 +45,6 @@ from vllm.distributed.parallel_state import (
     get_dcp_group,
     get_pp_group,
     get_tp_group,
-    get_world_group,
     graph_capture,
     is_global_first_rank,
     prepare_communication_buffer_for_model,
@@ -4447,29 +4446,34 @@ class GPUModelRunner(
             # send-recv to line up. The capturer gate + per-stage layer
             # filtering mean only some ranks see a given capture (e.g. a
             # request that captures a layer living on a single PP stage),
-            # so reduce the flag across the whole world: if ANY rank
-            # captures this step, ALL run eager. Gated on the feature flag
-            # (identical on every rank) so every rank reaches the
-            # collective; ``self.device`` keeps it off the host critical
-            # path apart from the single ``.item()`` sync.
+            # so OR-reduce the flag across both forward-collective groups:
+            # if ANY rank captures this step, ALL run eager. We reduce over
+            # the TP and PP groups (not the world group, which carries no
+            # device communicator) — sum-then-``>0`` over both yields the
+            # global OR. Gated on the feature flag (identical on every
+            # rank) so every rank reaches the collective.
             if self._capture_feature_enabled:
-                world = get_world_group()
-                if world.world_size > 1:
+                tp_group = get_tp_group()
+                pp_group = get_pp_group()
+                if tp_group.world_size > 1 or pp_group.world_size > 1:
                     local_capture = capture_pending
                     flag = torch.tensor(
                         [1 if local_capture else 0],
                         device=self.device,
                         dtype=torch.int32,
                     )
-                    flag = world.all_reduce(flag)
+                    if tp_group.world_size > 1:
+                        flag = tp_group.all_reduce(flag)
+                    if pp_group.world_size > 1:
+                        flag = pp_group.all_reduce(flag)
                     capture_pending = bool(flag.item() > 0)
                     if capture_pending:
                         # TODO(capture-pp): temporary instrumentation.
                         logger.info(
                             "[capture-debug] step force-eager: pp_rank=%d "
                             "tp_rank=%d local_capture=%s world_capture=%s",
-                            get_pp_group().rank_in_group,
-                            get_tp_group().rank_in_group,
+                            pp_group.rank_in_group,
+                            tp_group.rank_in_group,
                             local_capture,
                             capture_pending,
                         )
